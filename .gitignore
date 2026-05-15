@@ -5,3 +5,9 @@ venv/
 *.pptx
 *.mp3
 .idea/
+__pycache__/
+*.pyc
+output/
+build/
+dist/
+*.spec
