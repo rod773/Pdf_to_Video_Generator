@@ -1,30 +1,28 @@
-import fitz  # PyMuPDF
-from openai import OpenAI
+import fitz
 from pptx import Presentation
 from pptx.util import Inches, Pt
 from moviepy.editor import VideoFileClip, ImageClip, CompositeVideoClip, concatenate_videoclips, AudioFileClip
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 import tempfile
 import os
 import json
 import textwrap
-from pydantic import BaseModel, Field
 from typing import List, Optional, Dict
 from dotenv import load_dotenv
-from yt_shorts import process_shorts_from_results
 from presentation import generate_presentation, slides_to_images
 from audio import generate_audio
 import time
-import requests
 
 load_dotenv()
 
-client = OpenAI(
-    base_url=os.getenv("ENDPOINT"),
-    api_key=os.getenv("TOKEN"),
-)
+HAS_AI = bool(os.getenv("TOKEN"))
+if HAS_AI:
+    from openai import OpenAI
+    client = OpenAI(
+        base_url=os.getenv("ENDPOINT", "https://api.deepseek.com"),
+        api_key=os.getenv("TOKEN"),
+    )
 
-# Data models
 class SlideItem(BaseModel):
     title: str
     content: str
@@ -35,7 +33,7 @@ class ShortVideoSegment(BaseModel):
     title: str
     content: str
     script: str
-    duration: float = 60.0  # Target duration in seconds
+    duration: float = 60.0
 
 class SlideChunk(BaseModel):
     slides: List[SlideItem]
@@ -52,117 +50,78 @@ class VideoConfig(BaseModel):
     aspect_ratio: str = "16:9"
     animation_level: str = "moderate"
 
-# Step 1: Extract PDF Content
+DEFAULT_COLORS = {"primary": "1F497D", "secondary": "4F81BD", "accent": "C0504D", "background": "FFFFFF", "text": "000000"}
+
 def extract_text_from_pdf(pdf_path):
     print("Extracting text from PDF...")
     doc = fitz.open(pdf_path)
-    text = ""
+    pages = []
     for page in doc:
-        text += page.get_text()
-    print("✅ Text extracted.")
-    return text
+        t = page.get_text().strip()
+        if t:
+            pages.append(t)
+    print(f"Extracted {len(pages)} pages.")
+    return pages
 
-def chunk_text(text, chunk_size=100000):
-    print("Chunking text...")
-    chunks = textwrap.wrap(text, chunk_size, break_long_words=False)
-    print(f"✅ Created {len(chunks)} chunks.")
-    return chunks
+def generate_with_ai(pages, config):
+    print("Generating structured content with DeepSeek...")
+    chunk_size = 100000
+    full_text = "\n\n".join(pages)
+    chunks = textwrap.wrap(full_text, chunk_size, break_long_words=False)
+    all_slides, all_results = [], []
+    theme_colors = dict(DEFAULT_COLORS)
 
-def generate_chunk_content(chunk, config):
-    print("Generating structured content with OpenAI...")
-    theme_desc = {
-        "professional": "formal, corporate style with clean design",
-        "creative": "vibrant, engaging style with dynamic elements",
-        "minimal": "clean, simple style with focus on key content"
-    }.get(config.theme, "professional style")
+    for chunk in chunks:
+        theme_desc = {"professional": "formal, corporate style with clean design", "creative": "vibrant, engaging style with dynamic elements", "minimal": "clean, simple style with focus on key content"}.get(config.theme, "professional style")
+        voice_desc = {"neutral": "balanced and clear", "enthusiastic": "energetic and engaging", "formal": "serious and professional"}.get(config.voice_style, "clear and professional")
+        prompt = (
+            f"Generate a structured presentation based on the following content. "
+            f"Use a {theme_desc} visual approach and a {voice_desc} tone for narration.\n\n"
+            "Create a JSON with these keys:\n"
+            "1. 'slides': list of objects with 'title', 'content', 'key_points' (list of bullet points), "
+            "and 'voice_over' (narration script for this specific slide)\n"
+            "2. 'short_segments': 3-5 stand-alone segments for short-form videos (under 2 minutes each) "
+            "with 'title', 'content', 'script', and 'duration' (in seconds) fields\n"
+            "3. 'theme_colors': suggested color scheme (primary, secondary, accent, background, text)\n\n"
+            f"Content:\n{chunk}\n\nRespond with valid JSON only."
+        )
+        response = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=16000
+        ).choices[0].message.content.strip()
 
-    voice_desc = {
-        "neutral": "balanced and clear",
-        "enthusiastic": "energetic and engaging",
-        "formal": "serious and professional"
-    }.get(config.voice_style, "clear and professional")
+        if response.startswith("```json"):
+            response = response.lstrip("```json").rstrip("```").strip()
+        elif response.startswith("```"):
+            response = response.lstrip("```").rstrip("```").strip()
 
-    prompt = (
-        f"Generate a structured presentation based on the following content. "
-        f"Use a {theme_desc} visual approach and a {voice_desc} tone for narration.\n\n"
-        "Create a JSON with these keys:\n"
-        "1. 'slides': list of objects with 'title', 'content', 'key_points' (list of bullet points), "
-        "and 'voice_over' (narration script for this specific slide)\n"
-        "2. 'short_segments': 3-5 stand-alone segments for short-form videos (under 2 minutes each) "
-        "with 'title', 'content', 'script', and 'duration' (in seconds) fields\n"
-        "3. 'theme_colors': suggested color scheme (primary, secondary, accent, background, text)\n\n"
-        f"Content:\n{chunk}\n\n"
-        "Respond with valid JSON only. Keep all content factual and based on the input material."
-    )
+        parsed = json.loads(response)
+        validated = SlideChunk(**parsed)
+        if validated.theme_colors:
+            theme_colors = validated.theme_colors
+        all_results.append(validated)
+        all_slides.extend(validated.slides)
 
-    response = client.chat.completions.create(
-        model="openai/gpt-4.1",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.3,
-        max_tokens=16000
-    ).choices[0].message.content.strip()
+    return all_slides, all_results, theme_colors
 
-    if response.startswith("```json"):
-        response = response.lstrip("```json").rstrip("```").strip()
-    elif response.startswith("```"):
-        response = response.lstrip("```").rstrip("```").strip()
-
-    try:
-        parsed_response = json.loads(response)
-        validated_chunk = SlideChunk(**parsed_response)
-        print(validated_chunk)
-    except (json.JSONDecodeError, ValidationError) as e:
-        print(f"Parsing error: {e}\nResponse was: {response}")
-        raise
-
-    print("✅ Structured content generated.")
-    return validated_chunk
-
-# API Integration Functions (Hypothetical Endpoints)
-# def submit_job(api_path, image_path, audio_path, head_name=None):
-#     with open(image_path, 'rb') as image_file, open(audio_path, 'rb') as audio_file:
-#         files = {
-#             'image': ('image.jpg', image_file, 'image/jpeg'),
-#             'audio': ('audio.mp3', audio_file, 'audio/mpeg'),
-#         }
-#         data = {}
-#         if head_name:
-#             data['head_name'] = head_name
-
-#         response = requests.post(
-#             f"{api_path}/generate-video/",
-#             files=files,
-#             data=data,
-#             headers={}
-#         )
-
-#         response.raise_for_status()
-#         return response.json()["job_id"]
-
-def check_status(api_path: str, job_id: str) -> dict:
-    """
-    Poll the job-status endpoint and return the full status payload.
-    """
-    url = f"{api_path}/job-status/{job_id}"
-    headers = {}
-    resp = requests.get(url, headers=headers)
-    resp.raise_for_status()
-    # returns something like {"status": "completed", "download_url": "/download-video/<job_id>"}
-    return resp.json()
-
-def download_video(api_path: str, job_id: str, save_path: str):
-    """
-    Download the completed video via streaming and save it locally.
-    """
-    url = f"{api_path}/download-video/{job_id}"
-    headers = {}
-    with requests.get(url, headers=headers, stream=True) as resp:
-        resp.raise_for_status()
-        with open(save_path, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=8_192):
-                if chunk:
-                    f.write(chunk)
-    return save_path
+def generate_direct(pages):
+    print("Direct mode: creating slides from page text (no API key).")
+    slides = []
+    for i, page_text in enumerate(pages):
+        lines = [l.strip() for l in page_text.split("\n") if l.strip()]
+        title = lines[0][:80] if lines else f"Page {i+1}"
+        sentences = page_text.replace("\n", " ").split(". ")
+        key_points = [s.strip() + "." for s in sentences if len(s.strip()) > 20][:6]
+        slides.append(SlideItem(
+            title=title,
+            content=page_text[:300].replace("\n", " "),
+            key_points=key_points,
+            voice_over=page_text[:2000],
+        ))
+    result = SlideChunk(slides=slides, theme_colors=DEFAULT_COLORS)
+    return slides, [result], DEFAULT_COLORS
 
 def main():
     args = Args()
@@ -172,70 +131,35 @@ def main():
         voice_style=args.voice,
         include_background_music=bool(args.music)
     )
-    text = extract_text_from_pdf(args.pdf_path)
-    chunks = chunk_text(text)
-    results = [generate_chunk_content(chunk, config) for chunk in chunks]
 
-    # Flatten all slides from all chunks
-    all_slides = [slide for result in results for slide in result.slides]
+    pages = extract_text_from_pdf(args.pdf_path)
 
-    # Generate presentation and slide images
+    if HAS_AI and args.use_ai:
+        all_slides, results, theme_colors = generate_with_ai(pages, config)
+    else:
+        all_slides, results, theme_colors = generate_direct(pages)
+
+    print(f"Total slides: {len(all_slides)}")
+
     ppt_file = "presentation.pptx"
     generate_presentation(results, ppt_file, config)
+
     with tempfile.TemporaryDirectory() as tmpdir:
-        slide_imgs = slides_to_images(ppt_file, tmpdir)
+        slide_imgs = slides_to_images(ppt_file, tmpdir, slides_data=all_slides, theme_colors=theme_colors)
 
-        jobs = []
-        # for slide in all_slides:
-        #     job_id = submit_job(args.api_path, args.avatar, slide.voice_over)
-        #     jobs.append({"job_id": job_id, "slide": slide, "status": "processing", "video_path": None})
-
-        # # Poll for job statuses
-        # while any(job["status"] != "completed" for job in jobs):
-        #     for job in jobs:
-        #         if job["status"] == "processing":
-        #             status = check_status(args.api_path, job["job_id"])
-        #             if status == "completed":
-        #                 video_path = os.path.join(tmpdir, f"presenter_{job['slide'].title}.mp4")
-        #                 download_video(args.api_path, job["job_id"], video_path)
-        #                 job["video_path"] = video_path
-        #                 job["status"] = "processed"
-        #             elif status == "failed":
-        #                 print(f"Job {job['job_id']} failed")
-        #                 job["status"] = "failed"
-        #     time.sleep(60)
-
-        # Create video clips
         clips = []
         for i, slide in enumerate(all_slides):
             slide_img = slide_imgs[i]
             audio_path = f"{i}_audio.mp3"
-            generate_audio(slide.voice_over,audio_path)
+            generate_audio(slide.voice_over, audio_path)
             audio = AudioFileClip(audio_path)
-
-            # presenter_video_path = next(job["video_path"] for job in jobs if job["slide"] == slide)
-            # presenter_clip = VideoFileClip(presenter_video_path)
             image_clip = ImageClip(slide_img).set_duration(audio.duration)
-            # presenter_clip = presenter_clip.resize(height=image_clip.h // 2)
-            # presenter_clip = presenter_clip.set_position(("right", "bottom"))
-            #final_clip = CompositeVideoClip([image_clip, presenter_clip]).set_audio(presenter_clip.audio)
             final_clip = CompositeVideoClip([image_clip]).set_audio(audio)
             clips.append(final_clip)
 
-        # Concatenate all clips
         final_video = concatenate_videoclips(clips, method="compose")
         final_video.write_videofile("final_video.mp4", fps=24)
-        print("✅ Main Video exported")
-
-        # # Generate YouTube Shorts
-        # shorts_config = VideoConfig(
-        #     theme=config.theme,
-        #     language=config.language,
-        #     voice_style=config.voice_style,
-        #     aspect_ratio="9:16"
-        # )
-        # process_shorts_from_results(results, shorts_config)
-        # print("✅ YouTube Shorts generated")
+        print("Video exported")
 
 class Args:
     pdf_path = 'contents/Basics_of_Machine_Learning_Notes.pdf'
@@ -246,6 +170,7 @@ class Args:
     voice = 'enthusiastic'
     output = '/content/output/'
     api_path = ''
+    use_ai = True
 
 if __name__ == "__main__":
     main()
